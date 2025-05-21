@@ -6,8 +6,8 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 from sklearn.model_selection import train_test_split
-from surprise import Dataset, Reader, SVD
-from surprise.model_selection import cross_validate
+import implicit
+from scipy.sparse import csr_matrix
 import os
 import re
 from collections import defaultdict
@@ -24,7 +24,8 @@ class HybridRecommendationSystem:
         self.title_to_id = {}
         self.tfidf_matrix = None
         self.cosine_sim = None
-        self.svd_model = None
+        self.als_model = None
+        self.user_item_matrix = None
 
     def load_data(self, data_path='./data'):
         """
@@ -141,13 +142,26 @@ class HybridRecommendationSystem:
 
     def train_collaborative_model(self):
         try:
-            reader = Reader(rating_scale=(1, 5))
-            data = Dataset.load_from_df(self.ratings_df[['user_id', 'movie_id', 'rating']], reader)
-            trainset = data.build_full_trainset()
+            # Create user-item matrix
+            user_ids = self.ratings_df['user_id'].astype('category').cat.codes.values
+            movie_ids = self.ratings_df['movie_id'].astype('category').cat.codes.values
+            ratings = self.ratings_df['rating'].values
 
-            # Reduce number of factors and epochs for better performance on Streamlit Cloud
-            self.svd_model = SVD(n_factors=50, n_epochs=10, lr_all=0.005, reg_all=0.02)
-            self.svd_model.fit(trainset)
+            # Create mappings between original IDs and internal indices
+            self.user_id_map = dict(enumerate(self.ratings_df['user_id'].astype('category').cat.categories))
+            self.movie_id_map = dict(enumerate(self.ratings_df['movie_id'].astype('category').cat.categories))
+
+            # Create inverse mappings
+            self.user_id_inv_map = {v: k for k, v in self.user_id_map.items()}
+            self.movie_id_inv_map = {v: k for k, v in self.movie_id_map.items()}
+
+            # Create sparse matrix
+            self.user_item_matrix = csr_matrix((ratings, (user_ids, movie_ids)))
+
+            # Initialize and train ALS model
+            self.als_model = implicit.als.AlternatingLeastSquares(factors=50, iterations=10, regularization=0.02)
+            self.als_model.fit(self.user_item_matrix)
+
             print("Collaborative filtering model trained.")
         except Exception as e:
             print(f"Error training collaborative model: {str(e)}")
@@ -155,20 +169,22 @@ class HybridRecommendationSystem:
 
     def get_collaborative_recommendations(self, user_id, top_n=10):
         try:
-            seen = self.ratings_df[self.ratings_df['user_id'] == user_id]['movie_id'].unique()
-            unseen = self.movies_df[~self.movies_df['movie_id'].isin(seen)]['movie_id'].values
+            # Convert user_id to internal index
+            user_internal_id = self.user_id_inv_map.get(user_id)
+            if user_internal_id is None:
+                return pd.DataFrame()
 
-            # Use a smaller sample for very large datasets to improve performance
-            if len(unseen) > 10000:
-                unseen = np.random.choice(unseen, 10000, replace=False)
+            # Get recommendations
+            recommendations = self.als_model.recommend(user_internal_id, self.user_item_matrix[user_internal_id],
+                                                       N=top_n)
 
-            predictions = [(mid, self.svd_model.predict(user_id, mid).est) for mid in unseen]
-            predictions.sort(key=lambda x: x[1], reverse=True)
-            top = predictions[:top_n]
-            top_movie_ids = [movie_id for movie_id, _ in top]
-            top_scores = [score for _, score in top]
-            df = self.movies_df[self.movies_df['movie_id'].isin(top_movie_ids)].copy()
-            df['predicted_rating'] = df['movie_id'].map(dict(zip(top_movie_ids, top_scores)))
+            # Convert internal movie IDs back to original IDs
+            recommended_movie_ids = [self.movie_id_map[movie_internal_id] for movie_internal_id, _ in recommendations]
+            scores = [score for _, score in recommendations]
+
+            # Create result DataFrame
+            df = self.movies_df[self.movies_df['movie_id'].isin(recommended_movie_ids)].copy()
+            df['predicted_rating'] = df['movie_id'].map(dict(zip(recommended_movie_ids, scores)))
             return df[['movie_id', 'title', 'genres', 'predicted_rating']].sort_values('predicted_rating',
                                                                                        ascending=False)
         except Exception as e:
@@ -216,19 +232,35 @@ class HybridRecommendationSystem:
                 eval_df = self.ratings_df
 
             train_df, test_df = train_test_split(eval_df, test_size=test_size, random_state=42)
-            reader = Reader(rating_scale=(1, 5))
-            train_data = Dataset.load_from_df(train_df[['user_id', 'movie_id', 'rating']], reader)
-            test_data = Dataset.load_from_df(test_df[['user_id', 'movie_id', 'rating']], reader)
 
-            svd = SVD(n_factors=50, n_epochs=10, lr_all=0.005, reg_all=0.02)
-            trainset = train_data.build_full_trainset()
-            svd.fit(trainset)
+            # Train model on training data
+            train_user_ids = train_df['user_id'].astype('category').cat.codes.values
+            train_movie_ids = train_df['movie_id'].astype('category').cat.codes.values
+            train_ratings = train_df['rating'].values
 
-            testset = test_data.build_full_trainset().build_testset()
-            predictions = svd.test(testset)
+            train_user_item_matrix = csr_matrix((train_ratings, (train_user_ids, train_movie_ids)))
 
-            actual = [pred.r_ui for pred in predictions]
-            predicted = [pred.est for pred in predictions]
+            als_model = implicit.als.AlternatingLeastSquares(factors=50, iterations=10, regularization=0.02)
+            als_model.fit(train_user_item_matrix)
+
+            # Prepare test data
+            test_user_ids = test_df['user_id'].map(
+                {v: k for k, v in enumerate(train_df['user_id'].astype('category').cat.categories)})
+            test_movie_ids = test_df['movie_id'].map(
+                {v: k for k, v in enumerate(train_df['movie_id'].astype('category').cat.categories)})
+
+            # Filter out users/items not in training data
+            test_df = test_df[test_user_ids.notna() & test_movie_ids.notna()]
+            test_user_ids = test_user_ids[test_user_ids.notna()].astype(int)
+            test_movie_ids = test_movie_ids[test_movie_ids.notna()].astype(int)
+
+            # Get predictions
+            predicted = []
+            actual = []
+            for user_id, movie_id, rating in zip(test_user_ids, test_movie_ids, test_df['rating']):
+                pred = als_model.predict(user_id, movie_id)
+                predicted.append(pred)
+                actual.append(rating)
 
             rmse = np.sqrt(mean_squared_error(actual, predicted))
             mae = mean_absolute_error(actual, predicted)
